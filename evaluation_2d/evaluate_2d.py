@@ -1,14 +1,16 @@
 import argparse
+import json
 import pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Compute 3D metrics between a generated dataset and a reference dataset."
+        description="Compute 2D metrics between a generated dataset and a reference dataset."
     )
     parser.add_argument(
         "--generated_path",
@@ -19,8 +21,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--reference_path",
         type=str,
-        required=True,
-        help="Path to reference dataset pickle.",
+        default=None,
+        help=(
+            "Path to reference dataset pickle. If omitted, --generated_path is used and reference "
+            "images are read from `true_data` when available."
+        ),
     )
     parser.add_argument(
         "--generated_split",
@@ -33,6 +38,18 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="valid",
         help="Split key in reference dataset (default: valid).",
+    )
+    parser.add_argument(
+        "--generated_image_key",
+        type=str,
+        default="image",
+        help="Image key for generated samples (default: image). Use 'auto' to try common keys.",
+    )
+    parser.add_argument(
+        "--reference_image_key",
+        type=str,
+        default="auto",
+        help="Image key for reference samples (default: auto, tries true_data/reference_image/image).",
     )
     parser.add_argument(
         "--num_samples",
@@ -57,8 +74,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fid_batch_size",
         type=int,
-        default=8,
-        help="Batch size for R3D-18 feature extraction used by 3D FID.",
+        default=16,
+        help="Batch size for InceptionV3 feature extraction used by 2D FID.",
     )
     parser.add_argument(
         "--ms_ssim_weights",
@@ -75,7 +92,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip_fid",
         action="store_true",
-        help="Skip 3D FID computation.",
+        help="Skip 2D FID computation.",
+    )
+    parser.add_argument(
+        "--output_json",
+        type=str,
+        default=None,
+        help="Optional path to save computed metrics as JSON.",
     )
     return parser.parse_args()
 
@@ -118,36 +141,46 @@ def _resolve_split(data: Dict, split_name: str, label: str, path: Path) -> List[
     return split
 
 
-def _ensure_channel_first_3d(tensor: torch.Tensor, *, source: str) -> torch.Tensor:
-    x = torch.as_tensor(tensor).squeeze()
-    if x.ndim == 3:
+def _ensure_channel_first_2d(tensor: torch.Tensor, *, source: str) -> torch.Tensor:
+    x = torch.as_tensor(tensor, dtype=torch.float32).squeeze()
+    if x.ndim == 2:
         return x.unsqueeze(0)
-    if x.ndim != 4:
-        raise ValueError(f"{source}: expected 3D/4D volume, got shape {tuple(x.shape)}.")
+    if x.ndim != 3:
+        raise ValueError(f"{source}: expected 2D/3D image, got shape {tuple(x.shape)}.")
 
     if x.shape[0] <= 4:
         return x
     if x.shape[-1] <= 4:
-        return x.permute(3, 0, 1, 2).contiguous()
-    return x
+        return x.permute(2, 0, 1).contiguous()
+    raise ValueError(
+        f"{source}: cannot infer channel dimension from shape {tuple(x.shape)}. "
+        "Expected [C,H,W], [H,W,C], or [H,W]."
+    )
 
 
-def _extract_volume(entry: dict, *, source: str) -> torch.Tensor:
-    if "image" in entry:
-        return _ensure_channel_first_3d(
-            torch.as_tensor(entry["image"], dtype=torch.float32), source=f"{source}['image']"
-        )
-    if "true_data" in entry:
-        return _ensure_channel_first_3d(
-            torch.as_tensor(entry["true_data"], dtype=torch.float32), source=f"{source}['true_data']"
-        )
-    raise KeyError(f"{source}: expected one of keys ['image', 'true_data'].")
+def _extract_image(entry: dict, *, source: str, image_key: str, reference: bool) -> torch.Tensor:
+    if image_key != "auto":
+        if image_key not in entry:
+            raise KeyError(f"{source}: expected key '{image_key}'.")
+        return _ensure_channel_first_2d(entry[image_key], source=f"{source}['{image_key}']")
+
+    key_candidates = (
+        ("true_data", "reference_image", "image")
+        if reference
+        else ("image", "generated_image", "true_data")
+    )
+    for key in key_candidates:
+        if key in entry:
+            return _ensure_channel_first_2d(entry[key], source=f"{source}['{key}']")
+    raise KeyError(f"{source}: expected one of keys {list(key_candidates)}.")
 
 
-def _pair_volumes(
+def _pair_images(
     generated_entries: Sequence[dict],
     reference_entries: Sequence[dict],
     num_samples: Optional[int],
+    generated_image_key: str,
+    reference_image_key: str,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     max_pairs = min(len(generated_entries), len(reference_entries))
     if max_pairs <= 0:
@@ -157,22 +190,32 @@ def _pair_volumes(
     if n <= 0:
         raise ValueError(f"Invalid requested sample count: {num_samples}.")
 
-    true_volumes: List[torch.Tensor] = []
-    generated_volumes: List[torch.Tensor] = []
+    true_images: List[torch.Tensor] = []
+    generated_images: List[torch.Tensor] = []
 
     for i in range(n):
-        gen_vol = _extract_volume(generated_entries[i], source=f"generated[{i}]")
-        ref_vol = _extract_volume(reference_entries[i], source=f"reference[{i}]")
-        if gen_vol.shape != ref_vol.shape:
+        gen_image = _extract_image(
+            generated_entries[i],
+            source=f"generated[{i}]",
+            image_key=generated_image_key,
+            reference=False,
+        )
+        ref_image = _extract_image(
+            reference_entries[i],
+            source=f"reference[{i}]",
+            image_key=reference_image_key,
+            reference=True,
+        )
+        if gen_image.shape != ref_image.shape:
             raise ValueError(
-                f"Shape mismatch at sample {i}: generated {tuple(gen_vol.shape)} "
-                f"vs reference {tuple(ref_vol.shape)}."
+                f"Shape mismatch at sample {i}: generated {tuple(gen_image.shape)} "
+                f"vs reference {tuple(ref_image.shape)}."
             )
-        generated_volumes.append(gen_vol)
-        true_volumes.append(ref_vol)
+        generated_images.append(gen_image)
+        true_images.append(ref_image)
 
-    true_stack = torch.stack(true_volumes, dim=0)
-    gen_stack = torch.stack(generated_volumes, dim=0)
+    true_stack = torch.stack(true_images, dim=0)
+    gen_stack = torch.stack(generated_images, dim=0)
     return true_stack, gen_stack
 
 
@@ -211,31 +254,30 @@ def _normalize_pair(
     raise ValueError(f"Unsupported normalization mode '{mode}'.")
 
 
-def _to_three_channels(volumes: torch.Tensor) -> torch.Tensor:
-    c = int(volumes.shape[1])
+def _to_three_channels(images: torch.Tensor) -> torch.Tensor:
+    c = int(images.shape[1])
     if c == 3:
-        return volumes
+        return images
     if c < 3:
         repeats = (3 + c - 1) // c
-        return volumes.repeat(1, repeats, 1, 1, 1)[:, :3]
-    return volumes[:, :3]
+        return images.repeat(1, repeats, 1, 1)[:, :3]
+    return images[:, :3]
 
 
-def _load_r3d18_backbone(device: torch.device) -> torch.nn.Module:
+def _load_inception_backbone(device: torch.device) -> torch.nn.Module:
     try:
         import torchvision
     except Exception as exc:
         raise ImportError(
-            "torchvision is required for 3D FID. Install torchvision or use --skip_fid."
+            "torchvision is required for 2D FID. Install torchvision or use --skip_fid."
         ) from exc
 
     try:
-        model = torchvision.models.video.r3d_18(
-            weights=torchvision.models.video.R3D_18_Weights.DEFAULT
-        )
+        weights = torchvision.models.Inception_V3_Weights.DEFAULT
+        model = torchvision.models.inception_v3(weights=weights, aux_logits=True)
     except Exception as exc:
         raise RuntimeError(
-            "Failed to load pretrained r3d_18 weights for 3D FID. Use --skip_fid."
+            "Failed to load pretrained inception_v3 weights for 2D FID. Use --skip_fid."
         ) from exc
 
     model.fc = torch.nn.Identity()
@@ -245,15 +287,21 @@ def _load_r3d18_backbone(device: torch.device) -> torch.nn.Module:
 
 
 @torch.no_grad()
-def _extract_r3d_features(
+def _extract_inception_features(
     model: torch.nn.Module,
-    volumes: torch.Tensor,
+    images: torch.Tensor,
     device: torch.device,
     batch_size: int,
 ) -> torch.Tensor:
     feats: List[torch.Tensor] = []
-    for i in range(0, int(volumes.shape[0]), int(batch_size)):
-        batch = volumes[i : i + batch_size].to(device)
+    imagenet_mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    imagenet_std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    for i in range(0, int(images.shape[0]), int(batch_size)):
+        batch = images[i : i + batch_size].to(device)
+        batch = _to_three_channels(batch).clamp(0.0, 1.0)
+        batch = F.interpolate(batch, size=(299, 299), mode="bilinear", align_corners=False)
+        batch = (batch - imagenet_mean) / imagenet_std
         feats.append(model(batch).detach().cpu())
     return torch.cat(feats, dim=0)
 
@@ -269,7 +317,7 @@ def compute_metrics(
     skip_fid: bool,
 ) -> Dict[str, Union[float, None]]:
     try:
-        from monai.metrics import FIDMetric, compute_mmd, compute_ms_ssim
+        from monai.metrics import FIDMetric, compute_mmd, compute_ms_ssim, compute_ssim_and_cs
     except Exception as exc:
         raise ImportError(
             "MONAI metrics are required. Install monai (or ensure monai_generative installed MONAI)."
@@ -283,18 +331,32 @@ def compute_metrics(
         ms_ssim_value = compute_ms_ssim(
             true_images,
             generated_images,
-            3,
+            2,
             weights=ms_ssim_weights,
             kernel_size=int(ms_ssim_kernel_size),
         )
+        ssim_value, _ = compute_ssim_and_cs(
+            true_images,
+            generated_images,
+            2,
+            kernel_size=(int(ms_ssim_kernel_size), int(ms_ssim_kernel_size)),
+            kernel_sigma=(1.5, 1.5),
+        )
     except ValueError as exc:
         raise ValueError(
-            "MS-SSIM failed. If volumes are small, use fewer --ms_ssim_weights levels "
+            "SSIM/MS-SSIM failed. If images are small, use fewer --ms_ssim_weights levels "
             "or smaller --ms_ssim_kernel_size."
         ) from exc
+
+    mse_value = torch.mean((true_images - generated_images) ** 2)
+    psnr_value = 10.0 * torch.log10(1.0 / mse_value.clamp_min(1e-12))
+
     metrics: Dict[str, Union[float, None]] = {
         "mmd": float(mmd_value.item()),
         "ms_ssim": float(ms_ssim_value.mean().item()),
+        "ssim": float(ssim_value.mean().item()),
+        "mse": float(mse_value.item()),
+        "psnr": float(psnr_value.item()),
         "fid": None,
     }
 
@@ -302,12 +364,12 @@ def compute_metrics(
         return metrics
 
     fid_metric = FIDMetric()
-    r3d_model = _load_r3d18_backbone(device)
-    real_features = _extract_r3d_features(
-        r3d_model, _to_three_channels(true_images), device, fid_batch_size
+    inception_model = _load_inception_backbone(device)
+    real_features = _extract_inception_features(
+        inception_model, true_images, device, fid_batch_size
     )
-    gen_features = _extract_r3d_features(
-        r3d_model, _to_three_channels(generated_images), device, fid_batch_size
+    gen_features = _extract_inception_features(
+        inception_model, generated_images, device, fid_batch_size
     )
     fid_score = fid_metric(real_features, gen_features)
     metrics["fid"] = float(fid_score.item())
@@ -320,7 +382,11 @@ def main() -> None:
     device = _resolve_device(args.device)
 
     generated_path = Path(args.generated_path).expanduser().resolve()
-    reference_path = Path(args.reference_path).expanduser().resolve()
+    reference_path = (
+        generated_path
+        if args.reference_path is None
+        else Path(args.reference_path).expanduser().resolve()
+    )
     if not generated_path.exists():
         raise FileNotFoundError(f"--generated_path does not exist: {generated_path}")
     if not reference_path.exists():
@@ -335,8 +401,12 @@ def main() -> None:
         reference_data, args.reference_split, label="Reference", path=reference_path
     )
 
-    true_images, generated_images = _pair_volumes(
-        generated_entries, reference_entries, args.num_samples
+    true_images, generated_images = _pair_images(
+        generated_entries,
+        reference_entries,
+        args.num_samples,
+        args.generated_image_key,
+        args.reference_image_key,
     )
     true_images, generated_images = _normalize_pair(true_images, generated_images, args.normalization)
 
@@ -355,10 +425,27 @@ def main() -> None:
     print(f"Samples used: {int(generated_images.shape[0])}")
     print(f"MMD: {metrics['mmd']:.6f}")
     print(f"MS-SSIM: {metrics['ms_ssim']:.6f}")
+    print(f"SSIM: {metrics['ssim']:.6f}")
+    print(f"MSE: {metrics['mse']:.6f}")
+    print(f"PSNR: {metrics['psnr']:.6f}")
     if metrics["fid"] is None:
         print("FID: skipped")
     else:
         print(f"FID: {metrics['fid']:.6f}")
+
+    if args.output_json is not None:
+        output_json = Path(args.output_json).expanduser().resolve()
+        output_json.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "generated_path": str(generated_path),
+            "reference_path": str(reference_path),
+            "generated_split": args.generated_split,
+            "reference_split": args.reference_split,
+            "samples_used": int(generated_images.shape[0]),
+            "metrics": metrics,
+        }
+        output_json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"Saved JSON: {output_json}")
 
 
 if __name__ == "__main__":
