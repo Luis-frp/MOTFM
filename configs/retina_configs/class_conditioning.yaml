@@ -41,6 +41,7 @@ train_args:
   device: "cuda" 
   num_val_samples: 10
   checkpoint_dir: class_conditioning_checkpoints
+  
 
 solver_args: 
   # ODE/flow matching hyperparameters
