@@ -178,38 +178,96 @@ def sample_with_solver(
     )
     return sol
 
+def tensor_to_display(img):
+    """
+    Converte tensor para formato aceito pelo matplotlib.
+
+    Aceita:
+        [H, W]
+        [1, H, W]
+        [3, H, W]
+
+    Retorna:
+        [H, W] ou [H, W, 3]
+    """
+    img = img.detach().cpu()
+
+    if img.dim() == 3:
+        if img.shape[0] == 1:
+            img = img.squeeze(0)
+        elif img.shape[0] == 3:
+            img = img.permute(1, 2, 0)
+
+    return img.numpy()
 
 def plot_solver_steps(sol, im_batch, mask_batch, class_batch, class_map, outdir, max_plot=4):
-    if sol.dim() != 5:  # No intermediates to plot
+    if sol.dim() != 5:
         return
+
     n_samples = min(sol.shape[1], max_plot)
     n_steps = sol.shape[0]
+
     if mask_batch is not None:
         fig, axes = plt.subplots(n_samples, n_steps + 2, figsize=(20, 8))
     else:
         fig, axes = plt.subplots(n_samples, n_steps + 1, figsize=(20, 8))
+
     if n_samples == 1:
         axes = [axes]
+
     for i in range(n_samples):
+
+        # passos do solver
         for t in range(n_steps):
-            axes[i][t].imshow(sol[t, i].cpu().numpy().squeeze(), cmap="gray")
+
+            img = tensor_to_display(sol[t, i])
+
+            if img.ndim == 2:
+                axes[i][t].imshow(img, cmap="gray")
+            else:
+                axes[i][t].imshow(img)
+
             axes[i][t].axis("off")
+
             if i == 0:
                 axes[i][t].set_title(f"Step {t}")
+
         col = n_steps
+
+        # máscara
         if mask_batch is not None:
-            axes[i][col].imshow(mask_batch[i].cpu().numpy().squeeze(), cmap="gray")
+
+            mask = tensor_to_display(mask_batch[i])
+
+            if mask.ndim == 2:
+                axes[i][col].imshow(mask, cmap="gray")
+            else:
+                axes[i][col].imshow(mask)
+
             axes[i][col].axis("off")
+
             if i == 0:
                 axes[i][col].set_title("Mask")
+
             col += 1
-        axes[i][col].imshow(im_batch[i].cpu().numpy().squeeze(), cmap="gray")
+
+        # imagem real
+        real_img = tensor_to_display(im_batch[i])
+
+        if real_img.ndim == 2:
+            axes[i][col].imshow(real_img, cmap="gray")
+        else:
+            axes[i][col].imshow(real_img)
+
         axes[i][col].axis("off")
+
         if i == 0:
             axes[i][col].set_title("Real")
+
         if class_map and class_batch is not None:
             idx = class_batch[i].argmax().item()
             cls = class_name_from_map(class_map, idx)
+
             axes[i][col].text(
                 0.5,
                 -0.15,
@@ -220,9 +278,60 @@ def plot_solver_steps(sol, im_batch, mask_batch, class_batch, class_map, outdir,
                 color="red",
                 fontsize=9,
             )
+
     plt.tight_layout()
-    plt.savefig(os.path.join(outdir, "solver_steps.png"), bbox_inches="tight", pad_inches=0)
+    plt.savefig(
+        os.path.join(outdir, "solver_steps.png"),
+        bbox_inches="tight",
+        pad_inches=0,
+    )
     plt.close()
+    
+
+# def plot_solver_steps(sol, im_batch, mask_batch, class_batch, class_map, outdir, max_plot=4):
+#     if sol.dim() != 5:  # No intermediates to plot
+#         return
+#     n_samples = min(sol.shape[1], max_plot)
+#     n_steps = sol.shape[0]
+#     if mask_batch is not None:
+#         fig, axes = plt.subplots(n_samples, n_steps + 2, figsize=(20, 8))
+#     else:
+#         fig, axes = plt.subplots(n_samples, n_steps + 1, figsize=(20, 8))
+#     if n_samples == 1:
+#         axes = [axes]
+#     for i in range(n_samples):
+#         for t in range(n_steps):
+#             axes[i][t].imshow(sol[t, i].cpu().numpy().squeeze(), cmap="gray")
+#             axes[i][t].axis("off")
+#             if i == 0:
+#                 axes[i][t].set_title(f"Step {t}")
+#         col = n_steps
+#         if mask_batch is not None:
+#             axes[i][col].imshow(mask_batch[i].cpu().numpy().squeeze(), cmap="gray")
+#             axes[i][col].axis("off")
+#             if i == 0:
+#                 axes[i][col].set_title("Mask")
+#             col += 1
+#         axes[i][col].imshow(im_batch[i].cpu().numpy().squeeze(), cmap="gray")
+#         axes[i][col].axis("off")
+#         if i == 0:
+#             axes[i][col].set_title("Real")
+#         if class_map and class_batch is not None:
+#             idx = class_batch[i].argmax().item()
+#             cls = class_name_from_map(class_map, idx)
+#             axes[i][col].text(
+#                 0.5,
+#                 -0.15,
+#                 f"Class: {cls}",
+#                 ha="center",
+#                 va="top",
+#                 transform=axes[i][col].transAxes,
+#                 color="red",
+#                 fontsize=9,
+#             )
+#     plt.tight_layout()
+#     plt.savefig(os.path.join(outdir, "solver_steps.png"), bbox_inches="tight", pad_inches=0)
+#     plt.close()
 
 
 def validate_and_save_samples(
