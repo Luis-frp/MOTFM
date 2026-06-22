@@ -59,6 +59,24 @@ def _resolve_requested_class(
     )
 
 
+def _resolve_num_classes(*, class_values, class_map) -> Optional[int]:
+    if class_values is not None:
+        return len(class_values)
+    if class_map is None:
+        return None
+    if isinstance(class_map, dict):
+        return len(class_map)
+    return len(class_map)
+
+
+def _describe_class_source(*, class_values, class_map) -> str:
+    if class_values is not None:
+        return "config:data_args.class_values"
+    if class_map is not None:
+        return "pickle:class_map"
+    return "unknown"
+
+
 def _select_checkpoint_file(ckpt_dir: str) -> Optional[str]:
     """
     Pick an appropriate checkpoint file from a directory.
@@ -442,10 +460,13 @@ def main():
         class_map=idx_to_class,
         class_values=class_values,
     )
+    class_source = _describe_class_source(class_values=class_values, class_map=idx_to_class)
+    num_classes = _resolve_num_classes(class_values=class_values, class_map=idx_to_class)
     logger.info(
         f"Conditioning modes: class_conditioning={class_conditioning}, "
         f"mask_conditioning={mask_conditioning}"
     )
+    logger.info(f"Class metadata source: {class_source}")
     if args.class_label is not None:
         logger.info(
             f"Requested generation class: label={requested_class_value!r}, index={requested_class_idx}"
@@ -482,17 +503,17 @@ def main():
                 else:
                     batch = dict(batch)
                     batch_size = int(batch["images"].shape[0])
-                    if class_values is not None:
-                        num_classes = len(class_values)
-                    elif idx_to_class is not None:
-                        num_classes = len(idx_to_class)
-                    else:
+                    if num_classes is None:
                         raise ValueError(
                             "Could not determine the number of classes needed to build the conditioning tensor."
                         )
                     class_tensor = torch.zeros((batch_size, int(num_classes)), dtype=torch.float32)
                     class_tensor[:, int(requested_class_idx)] = 1.0
                     batch["classes"] = class_tensor
+                    logger.info(
+                        f"Forcing batch conditioning to class={requested_class_value!r} "
+                        f"(index={requested_class_idx}, num_classes={num_classes})."
+                    )
 
             start_time = time.time()  # Start time for the batch
 
