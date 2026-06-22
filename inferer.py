@@ -429,6 +429,7 @@ def main():
 
     idx_to_class = val_data.get("class_map")
     model_args = config.get("model_args", {})
+    data_args = config.get("data_args", {})
     class_conditioning = bool(model_args.get("with_conditioning", False))
     mask_conditioning = bool(model_args.get("mask_conditioning", False))
     class_values = data_args.get("class_values")
@@ -450,7 +451,6 @@ def main():
             f"Requested generation class: label={requested_class_value!r}, index={requested_class_idx}"
         )
     # Save using the same split keys expected by the trainer config.
-    data_args = config.get("data_args", {})
     split_train_key = data_args.get("split_train", "train")
     split_val_key = data_args.get("split_val", "valid")
     logger.info(f"Output split keys: train='{split_train_key}', val='{split_val_key}'")
