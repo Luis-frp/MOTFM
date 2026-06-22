@@ -113,15 +113,18 @@ def resolve_checkpoint_path(
     run_name = os.path.splitext(os.path.basename(config_path))[0]
     root_dir = config["train_args"]["checkpoint_dir"]
 
-    candidate_paths = (
-        [
-            model_path,
-            os.path.join(model_path, run_name),
-            os.path.join(model_path, "latest"),
-        ]
-        if model_path
-        else [os.path.join(root_dir, run_name)]
-    )
+    if model_path:
+        expanded_model_path = os.path.abspath(os.path.expanduser(model_path))
+        if os.path.isfile(expanded_model_path):
+            candidate_paths = [expanded_model_path]
+        else:
+            candidate_paths = [
+                expanded_model_path,
+                os.path.join(expanded_model_path, run_name),
+                os.path.join(expanded_model_path, "latest"),
+            ]
+    else:
+        candidate_paths = [os.path.join(root_dir, run_name)]
 
     for candidate in candidate_paths:
         resolved = _resolve_checkpoint_candidate(candidate)
