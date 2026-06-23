@@ -41,6 +41,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", default=42, type=int, help="Random split seed.")
     parser.add_argument(
+        "--patient_level",
+        default=1,
+        type=int,
+        help=(
+            "Directory depth used to identify the patient from each image path. "
+            "1 means the first folder under --input_dir, 2 means the second, and so on."
+        ),
+    )
+    parser.add_argument(
         "--class_name",
         default="gastric_cancer",
         type=str,
@@ -87,6 +96,60 @@ def split_paths(
     return shuffled[valid_count:], shuffled[:valid_count]
 
 
+def get_patient_id(path: Path, root: Path, patient_level: int) -> str:
+    rel_parts = path.relative_to(root).parts
+    if patient_level < 1:
+        raise ValueError("--patient_level must be >= 1.")
+    if len(rel_parts) < patient_level:
+        raise ValueError(
+            f"Cannot infer patient id from '{path}': "
+            f"relative path has only {len(rel_parts)} part(s), but --patient_level={patient_level}."
+        )
+    return rel_parts[patient_level - 1]
+
+
+def split_paths_by_patient(
+    paths: List[Path], root: Path, valid_fraction: float, seed: int, patient_level: int
+) -> Tuple[List[Path], List[Path]]:
+    if not 0.0 < valid_fraction < 1.0:
+        raise ValueError("--valid_fraction must be between 0 and 1.")
+
+    patient_to_paths = {}
+    for path in paths:
+        patient_id = get_patient_id(path, root, patient_level)
+        patient_to_paths.setdefault(patient_id, []).append(path)
+
+    patients = list(patient_to_paths.keys())
+    rng = random.Random(seed)
+    rng.shuffle(patients)
+
+    valid_target = max(1, int(round(len(paths) * valid_fraction)))
+    valid_patients = []
+    valid_count = 0
+    for patient_id in patients:
+        if valid_count >= valid_target and len(valid_patients) > 0:
+            break
+        valid_patients.append(patient_id)
+        valid_count += len(patient_to_paths[patient_id])
+
+    if len(valid_patients) == len(patients):
+        if len(valid_patients) < 2:
+            raise ValueError("Need at least 2 patients to create a train/valid split.")
+        valid_patients = valid_patients[:1]
+
+    valid_set = set(valid_patients)
+    valid_paths = [p for pid in valid_patients for p in patient_to_paths[pid]]
+    train_paths = [p for pid in patients if pid not in valid_set for p in patient_to_paths[pid]]
+
+    if not train_paths or not valid_paths:
+        raise ValueError(
+            "Failed to create a non-empty train/valid split by patient. "
+            "Check --patient_level and --valid_fraction."
+        )
+
+    return train_paths, valid_paths
+
+
 def build_entries(
     paths: List[Path],
     root: Path,
@@ -120,7 +183,13 @@ def main() -> None:
     if len(paths) < 2:
         raise ValueError(f"Need at least 2 images, found {len(paths)} in {input_dir}.")
 
-    train_paths, valid_paths = split_paths(paths, args.valid_fraction, args.seed)
+    train_paths, valid_paths = split_paths_by_patient(
+        paths,
+        input_dir,
+        args.valid_fraction,
+        args.seed,
+        args.patient_level,
+    )
     dataset = {
         "train": build_entries(
             train_paths,
