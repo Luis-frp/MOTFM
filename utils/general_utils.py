@@ -484,16 +484,45 @@ def create_dataloader(
 ###############################################################################
 # Image Saving
 ###############################################################################
+# def save_image(img_tensor, out_path):
+#     """
+#     Saves a single 2D image (assumed shape [1, H, W] or [H, W]) as PNG.
+#     """
+#     os.makedirs(os.path.dirname(out_path), exist_ok=True)
+#     # remove batch/channel dims if present
+
+#     if img_tensor.dim() == 3 and img_tensor.shape[0] == 1:
+#         img_tensor = img_tensor.squeeze(0)
+
+#     plt.figure()
+#     plt.imshow(img_tensor.cpu().numpy(), cmap="gray")
+#     plt.axis("off")
+#     plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
+#     plt.close()
+
 def save_image(img_tensor, out_path):
     """
-    Saves a single 2D image (assumed shape [1, H, W] or [H, W]) as PNG.
+    Save image tensor as PNG.
+    Supports:
+        [H,W]
+        [1,H,W]
+        [3,H,W]
     """
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    # remove batch/channel dims if present
-    if img_tensor.dim() == 3 and img_tensor.shape[0] == 1:
-        img_tensor = img_tensor.squeeze(0)
+    img = img_tensor.detach().cpu()
+    if img.dim() == 3:
+        # Grayscale
+        if img.shape[0] == 1:
+            img = img.squeeze(0)
+        # RGB: CHW -> HWC
+        elif img.shape[0] == 3:
+            img = img.permute(1, 2, 0)
+    img = img.numpy()
     plt.figure()
-    plt.imshow(img_tensor.cpu().numpy(), cmap="gray")
+    if img.ndim == 2:
+        plt.imshow(img, cmap="gray")
+    else:
+        plt.imshow(img)
     plt.axis("off")
     plt.savefig(out_path, bbox_inches="tight", pad_inches=0)
     plt.close()

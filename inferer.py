@@ -22,6 +22,61 @@ from trainer import FlowMatchingDataModule, FlowMatchingLightningModule
 logger = get_logger(__name__)
 
 
+def _resolve_requested_class(
+    requested_class,
+    *,
+    class_map,
+    class_values,
+):
+    """Resolve a user-requested class label/index against the available mapping."""
+    if requested_class is None:
+        return None, None
+
+    if isinstance(requested_class, int):
+        class_idx = requested_class
+        class_value = class_label_from_map(class_map, class_idx, default=class_idx)
+        return class_idx, class_value
+
+    if class_values is not None and requested_class in class_values:
+        class_idx = class_values.index(requested_class)
+        class_value = class_label_from_map(class_map, class_idx, default=requested_class)
+        return class_idx, class_value
+
+    if class_map is not None:
+        items = class_map.items() if isinstance(class_map, dict) else enumerate(class_map)
+        for idx, value in items:
+            if str(value) == str(requested_class):
+                return int(idx), value
+
+    if isinstance(requested_class, str) and requested_class.isdigit():
+        class_idx = int(requested_class)
+        class_value = class_label_from_map(class_map, class_idx, default=class_idx)
+        return class_idx, class_value
+
+    raise ValueError(
+        f"Could not resolve requested class '{requested_class}'. "
+        "Pass a valid class name or index that exists in the dataset mapping."
+    )
+
+
+def _resolve_num_classes(*, class_values, class_map) -> Optional[int]:
+    if class_values is not None:
+        return len(class_values)
+    if class_map is None:
+        return None
+    if isinstance(class_map, dict):
+        return len(class_map)
+    return len(class_map)
+
+
+def _describe_class_source(*, class_values, class_map) -> str:
+    if class_values is not None:
+        return "config:data_args.class_values"
+    if class_map is not None:
+        return "pickle:class_map"
+    return "unknown"
+
+
 def _select_checkpoint_file(ckpt_dir: str) -> Optional[str]:
     """
     Pick an appropriate checkpoint file from a directory.
@@ -76,15 +131,18 @@ def resolve_checkpoint_path(
     run_name = os.path.splitext(os.path.basename(config_path))[0]
     root_dir = config["train_args"]["checkpoint_dir"]
 
-    candidate_paths = (
-        [
-            model_path,
-            os.path.join(model_path, run_name),
-            os.path.join(model_path, "latest"),
-        ]
-        if model_path
-        else [os.path.join(root_dir, run_name)]
-    )
+    if model_path:
+        expanded_model_path = os.path.abspath(os.path.expanduser(model_path))
+        if os.path.isfile(expanded_model_path):
+            candidate_paths = [expanded_model_path]
+        else:
+            candidate_paths = [
+                expanded_model_path,
+                os.path.join(expanded_model_path, run_name),
+                os.path.join(expanded_model_path, "latest"),
+            ]
+    else:
+        candidate_paths = [os.path.join(root_dir, run_name)]
 
     for candidate in candidate_paths:
         resolved = _resolve_checkpoint_candidate(candidate)
@@ -238,6 +296,15 @@ def main():
         help="Number of samples to save. If omitted, all validation samples are saved.",
     )
     parser.add_argument(
+        "--class_label",
+        type=str,
+        default=None,
+        help=(
+            "Class label or class index to force during generation. "
+            "If omitted, the class from each validation sample is used."
+        ),
+    )
+    parser.add_argument(
         "--model_path",
         type=str,
         default=None,
@@ -380,14 +447,31 @@ def main():
 
     idx_to_class = val_data.get("class_map")
     model_args = config.get("model_args", {})
+    data_args = config.get("data_args", {})
     class_conditioning = bool(model_args.get("with_conditioning", False))
     mask_conditioning = bool(model_args.get("mask_conditioning", False))
+    class_values = data_args.get("class_values")
+    if isinstance(class_values, str):
+        class_values = [item.strip() for item in class_values.split(",") if item.strip()]
+    if class_values is not None:
+        class_values = list(class_values)
+    requested_class_idx, requested_class_value = _resolve_requested_class(
+        args.class_label,
+        class_map=idx_to_class,
+        class_values=class_values,
+    )
+    class_source = _describe_class_source(class_values=class_values, class_map=idx_to_class)
+    num_classes = _resolve_num_classes(class_values=class_values, class_map=idx_to_class)
     logger.info(
         f"Conditioning modes: class_conditioning={class_conditioning}, "
         f"mask_conditioning={mask_conditioning}"
     )
+    logger.info(f"Class metadata source: {class_source}")
+    if args.class_label is not None:
+        logger.info(
+            f"Requested generation class: label={requested_class_value!r}, index={requested_class_idx}"
+        )
     # Save using the same split keys expected by the trainer config.
-    data_args = config.get("data_args", {})
     split_train_key = data_args.get("split_train", "train")
     split_val_key = data_args.get("split_val", "valid")
     logger.info(f"Output split keys: train='{split_train_key}', val='{split_val_key}'")
@@ -410,6 +494,26 @@ def main():
                 val_iterator = iter(val_loader)
                 batch = next(val_iterator)
                 iterator_resets += 1
+
+            if requested_class_idx is not None:
+                if not class_conditioning:
+                    logger.warning(
+                        "Ignoring --class_label because the loaded model is not class-conditioned."
+                    )
+                else:
+                    batch = dict(batch)
+                    batch_size = int(batch["images"].shape[0])
+                    if num_classes is None:
+                        raise ValueError(
+                            "Could not determine the number of classes needed to build the conditioning tensor."
+                        )
+                    class_tensor = torch.zeros((batch_size, int(num_classes)), dtype=torch.float32)
+                    class_tensor[:, int(requested_class_idx)] = 1.0
+                    batch["classes"] = class_tensor
+                    logger.info(
+                        f"Forcing batch conditioning to class={requested_class_value!r} "
+                        f"(index={requested_class_idx}, num_classes={num_classes})."
+                    )
 
             start_time = time.time()  # Start time for the batch
 
@@ -445,7 +549,9 @@ def main():
                 raw_global_max = np.maximum(raw_global_max, image_np.max())
 
                 class_value = None
-                if idx_to_class is not None and classes_np is not None:
+                if requested_class_value is not None:
+                    class_value = requested_class_value
+                elif idx_to_class is not None and classes_np is not None:
                     class_idx = int(classes_np[i].argmax())
                     class_value = class_label_from_map(idx_to_class, class_idx)
 
@@ -505,7 +611,6 @@ def main():
         pickle.dump(generated_dataset, f)
 
     logger.info(f"Generated data saved to {output_path}")
-
 
 if __name__ == "__main__":
     main()

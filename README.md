@@ -36,7 +36,6 @@ To install from `pyproject.toml`, run:
 pip install -e .
 ```
 
-
 ---
 
 ## Data Preparation
