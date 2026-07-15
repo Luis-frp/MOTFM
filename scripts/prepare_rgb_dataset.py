@@ -58,7 +58,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--class_from_parent",
         action="store_true",
-        help="Use each image's immediate parent folder name as its class label.",
+        help="Use an ancestor folder name as the class label.",
+    )
+    parser.add_argument(
+        "--class_parent_level",
+        default=1,
+        type=int,
+        help=(
+            "How many levels up from the image file to use as the class label. "
+            "1 means the immediate parent folder, 2 means the grandparent folder, and so on."
+        ),
+    )
+    parser.add_argument(
+        "--lazy",
+        action="store_true",
+        help="Store image paths instead of loading all images into memory; load them on demand during training.",
     )
     return parser.parse_args()
 
@@ -156,18 +170,32 @@ def build_entries(
     image_size: int,
     class_name: str,
     class_from_parent: bool,
+    class_parent_level: int,
+    lazy: bool,
 ) -> List[dict]:
+    if class_from_parent and class_parent_level < 1:
+        raise ValueError("--class_parent_level must be >= 1.")
+
     entries = []
     for path in paths:
-        class_label = path.parent.name if class_from_parent else class_name
-        entries.append(
-            {
-                "image": load_rgb_chw(path, image_size),
-                "class": class_label,
-                "name": path.stem,
-                "metadata": {"source_path": str(path.relative_to(root))},
-            }
-        )
+        if class_from_parent:
+            parent = path
+            for _ in range(class_parent_level):
+                parent = parent.parent
+            class_label = parent.name
+        else:
+            class_label = class_name
+
+        entry = {
+            "class": class_label,
+            "name": path.stem,
+            "metadata": {"source_path": str(path.relative_to(root))},
+        }
+        if not lazy:
+            entry["image"] = load_rgb_chw(path, image_size)
+        else:
+            entry["source_path"] = str(path.relative_to(root))
+        entries.append(entry)
     return entries
 
 
@@ -197,6 +225,8 @@ def main() -> None:
             args.image_size,
             args.class_name,
             args.class_from_parent,
+            args.class_parent_level,
+            args.lazy,
         ),
         "valid": build_entries(
             valid_paths,
@@ -204,6 +234,8 @@ def main() -> None:
             args.image_size,
             args.class_name,
             args.class_from_parent,
+            args.class_parent_level,
+            args.lazy,
         ),
     }
 
@@ -214,7 +246,10 @@ def main() -> None:
     print(f"Saved: {output_path}")
     print(f"Train samples: {len(dataset['train'])}")
     print(f"Valid samples: {len(dataset['valid'])}")
-    print(f"Image shape: {dataset['train'][0]['image'].shape}")
+    if args.lazy:
+        print("Storage mode: lazy (paths only)")
+    else:
+        print(f"Image shape: {dataset['train'][0]['image'].shape}")
 
 
 if __name__ == "__main__":

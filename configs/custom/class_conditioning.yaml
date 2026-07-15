@@ -20,7 +20,9 @@ model_args:
 
 data_args:
   # Path to your pickled dataset (frames, masks, etc.)
-  pickle_path: "./data/camus/dataset.pkl"
+  pickle_path: /tmp/iged_rgb.pkl
+  lazy_loading: true
+  image_size: 256
 
   image_norm: auto
   norm_scope: global

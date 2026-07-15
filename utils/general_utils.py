@@ -3,6 +3,7 @@ import yaml
 import torch
 import pickle
 import random
+from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -79,6 +80,74 @@ class CustomDataset(Dataset):
 
     def __getitem__(self, idx):
         return {key: value[idx] for key, value in self.data_dict.items()}
+
+
+class LazyImageDataset(Dataset):
+    def __init__(
+        self,
+        entries,
+        *,
+        image_size: int = 256,
+        image_norm: str = "minmax_0_1",
+        class_to_idx: Optional[Dict[object, int]] = None,
+        num_classes: Optional[int] = None,
+        convert_classes_to_onehot: bool = False,
+    ):
+        self.entries = entries
+        self.image_size = image_size
+        self.image_norm = image_norm
+        self.class_to_idx = class_to_idx
+        self.num_classes = num_classes
+        self.convert_classes_to_onehot = convert_classes_to_onehot
+
+    def __len__(self):
+        return len(self.entries)
+
+    def _load_image(self, entry: Dict[str, Any]) -> torch.Tensor:
+        source_path = entry.get("source_path")
+        if source_path is None and "metadata" in entry and isinstance(entry["metadata"], dict):
+            source_path = entry["metadata"].get("source_path")
+        if source_path is None:
+            raise KeyError("Entry is missing 'source_path'.")
+        path = Path(source_path)
+        if not path.is_absolute():
+            path = Path(entry.get("root", "")) / path
+        path = path.expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Image not found: {path}")
+
+        from PIL import Image, ImageOps
+
+        with Image.open(path) as img:
+            img = ImageOps.exif_transpose(img).convert("RGB")
+            img = ImageOps.fit(
+                img,
+                size=(self.image_size, self.image_size),
+                method=Image.Resampling.LANCZOS,
+                centering=(0.5, 0.5),
+            )
+            arr = np.asarray(img, dtype=np.float32) / 255.0
+        tensor = torch.from_numpy(np.transpose(arr, (2, 0, 1)).astype(np.float32, copy=False))
+
+        if self.image_norm != "none":
+            tensor = apply_normalization(tensor, mode=self.image_norm)
+        return tensor
+
+    def __getitem__(self, idx):
+        entry = self.entries[idx]
+        image = self._load_image(entry)
+        sample = {"images": image}
+        if "class" in entry:
+            class_label = entry["class"]
+            if self.convert_classes_to_onehot and self.class_to_idx is not None:
+                class_idx = self.class_to_idx[class_label]
+                sample["classes"] = torch.nn.functional.one_hot(
+                    torch.tensor([class_idx], dtype=torch.long),
+                    num_classes=int(self.num_classes or len(self.class_to_idx)),
+                ).float().squeeze(0)
+            else:
+                sample["classes"] = class_label
+        return sample
 
 
 def normalize_zero_to_one(tensor: torch.Tensor):
@@ -262,6 +331,8 @@ def load_and_prepare_data(
     class_to_idx: Optional[Dict[object, int]] = None,
     num_classes: Optional[int] = None,
     class_mapping_split: Optional[str] = None,
+    lazy: bool = False,
+    image_size: int = 256,
 ) -> Dict[str, torch.Tensor]:
     """
     Loads data from a pickle file containing a dict with:
@@ -279,6 +350,37 @@ def load_and_prepare_data(
     data_split = data_dict.get(split, [])
     if not data_split:
         raise ValueError(f"No data found for split '{split}' in the pickle file.")
+
+    if lazy:
+        root_dir = Path(pickle_path).expanduser().resolve().parent
+        entries = []
+        class_values = None
+        for entry in data_split:
+            entry_copy = dict(entry)
+            entry_copy.setdefault("root", str(root_dir))
+            if "class" in entry_copy:
+                class_values = class_values or []
+                if entry_copy["class"] not in class_values:
+                    class_values.append(entry_copy["class"])
+            entries.append(entry_copy)
+
+        if convert_classes_to_onehot:
+            if class_to_idx is None:
+                class_to_idx = {c: i for i, c in enumerate(sorted(class_values or []))}
+            if num_classes is None:
+                num_classes = len(class_to_idx)
+
+        return {
+            "dataset": LazyImageDataset(
+                entries,
+                image_size=image_size,
+                image_norm=image_norm,
+                class_to_idx=class_to_idx,
+                num_classes=num_classes,
+                convert_classes_to_onehot=convert_classes_to_onehot,
+            ),
+            "class_map": {i: c for c, i in class_to_idx.items()} if class_to_idx is not None else None,
+        }
 
     def _ensure_channel_first(x: torch.Tensor, *, name: str) -> torch.Tensor:
         if x.ndim < 2:

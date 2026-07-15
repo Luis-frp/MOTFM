@@ -85,14 +85,16 @@ class FlowMatchingDataModule(pl.LightningDataModule):
                 class_to_idx=class_to_idx,
                 num_classes=expected_num_classes,
                 class_mapping_split=data_config.get("split_train", "train"),
+                lazy=bool(data_config.get("lazy_loading", False)),
+                image_size=int(data_config.get("image_size", 256)),
             )
 
         def _assert_required_keys(data: dict, *, split_name: str) -> None:
-            if self.mask_conditioning and "masks" not in data:
+            if self.mask_conditioning and "masks" not in data and "dataset" not in data:
                 raise ValueError(
                     f"`model_args.mask_conditioning` is True but split '{split_name}' has no masks."
                 )
-            if self.class_conditioning and "classes" not in data:
+            if self.class_conditioning and "classes" not in data and "dataset" not in data:
                 raise ValueError(
                     f"`model_args.with_conditioning` is True but split '{split_name}' has no classes."
                 )
@@ -102,11 +104,18 @@ class FlowMatchingDataModule(pl.LightningDataModule):
             self.val_data = _load(data_config["split_val"])
             _assert_required_keys(self.train_data, split_name=data_config["split_train"])
             _assert_required_keys(self.val_data, split_name=data_config["split_val"])
-            logger.info(
-                "Loaded train/val splits: "
-                f"train={int(self.train_data['images'].shape[0])}, "
-                f"val={int(self.val_data['images'].shape[0])}."
-            )
+            if "dataset" in self.train_data and isinstance(self.train_data["dataset"], Dataset):
+                logger.info(
+                    "Loaded train/val splits lazily: "
+                    f"train_samples={len(self.train_data['dataset'])}, "
+                    f"val_samples={len(self.val_data['dataset'])}."
+                )
+            else:
+                logger.info(
+                    "Loaded train/val splits: "
+                    f"train={int(self.train_data['images'].shape[0])}, "
+                    f"val={int(self.val_data['images'].shape[0])}."
+                )
         elif stage == "validate":
             self.val_data = _load(data_config["split_val"])
             _assert_required_keys(self.val_data, split_name=data_config["split_val"])
@@ -152,6 +161,18 @@ class FlowMatchingDataModule(pl.LightningDataModule):
                     f"Using class-balanced sampling with {num_classes} classes and power={power:.3f}."
                 )
 
+        if "dataset" in self.train_data:
+            return DataLoader(
+                self.train_data["dataset"],
+                batch_size=tr_args["batch_size"],
+                shuffle=shuffle,
+                sampler=sampler,
+                num_workers=int(tr_args.get("num_workers", 0)),
+                pin_memory=tr_args.get("pin_memory", None),
+                persistent_workers=tr_args.get("persistent_workers", None),
+                drop_last=bool(tr_args.get("drop_last", False)),
+            )
+
         return create_dataloader(
             Images=self.train_data["images"],
             Masks=self.train_data.get("masks") if self.mask_conditioning else None,
@@ -167,6 +188,17 @@ class FlowMatchingDataModule(pl.LightningDataModule):
 
     def val_dataloader(self) -> torch.utils.data.DataLoader:
         tr_args = self.config["train_args"]
+        if "dataset" in self.val_data:
+            return DataLoader(
+                self.val_data["dataset"],
+                batch_size=tr_args["batch_size"],
+                shuffle=False,
+                num_workers=int(tr_args.get("num_workers", 0)),
+                pin_memory=tr_args.get("pin_memory", None),
+                persistent_workers=tr_args.get("persistent_workers", None),
+                drop_last=False,
+            )
+
         return create_dataloader(
             Images=self.val_data["images"],
             Masks=self.val_data.get("masks") if self.mask_conditioning else None,
