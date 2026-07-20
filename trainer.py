@@ -1,13 +1,17 @@
 import argparse
+import csv
+import json
 import os
-from typing import Optional, Union
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
 
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
 from pytorch_lightning.loggers import TensorBoardLogger
 
@@ -307,6 +311,90 @@ class FlowMatchingLightningModule(pl.LightningModule):
         )
 
 
+class MetricsHistoryCallback(Callback):
+    """Tracks per-epoch train/val loss, lr, and timing for later plotting.
+
+    The history is embedded in every Lightning checkpoint (via ``state_dict``/
+    ``load_state_dict``, which ``Trainer`` calls automatically on save/resume),
+    so it survives an interrupted-and-resumed run. It is also mirrored to
+    JSON/CSV files in ``log_dir`` after every epoch so it can be inspected or
+    plotted without loading a (large) checkpoint.
+    """
+
+    def __init__(self, log_dir: str):
+        self.log_dir = log_dir
+        self.history: List[Dict[str, Any]] = []
+        self._epoch_start_time: Optional[float] = None
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {"history": self.history}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.history = list(state_dict.get("history", []))
+
+    def _upsert(self, epoch: int, **fields: Any) -> None:
+        for row in self.history:
+            if row["epoch"] == epoch:
+                row.update({k: v for k, v in fields.items() if v is not None})
+                return
+        row = {"epoch": epoch}
+        row.update(fields)
+        self.history.append(row)
+        self.history.sort(key=lambda r: r["epoch"])
+
+    @staticmethod
+    def _current_lr(trainer: "pl.Trainer") -> Optional[float]:
+        try:
+            return float(trainer.optimizers[0].param_groups[0]["lr"])
+        except (IndexError, KeyError, AttributeError):
+            return None
+
+    def on_train_epoch_start(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        self._epoch_start_time = time.time()
+
+    def on_train_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        if not trainer.is_global_zero:
+            return
+        metrics = trainer.callback_metrics
+        train_loss = metrics.get("train/loss_epoch", metrics.get("train/loss"))
+        duration = time.time() - self._epoch_start_time if self._epoch_start_time else None
+        self._upsert(
+            trainer.current_epoch,
+            global_step=trainer.global_step,
+            train_loss=float(train_loss) if train_loss is not None else None,
+            lr=self._current_lr(trainer),
+            epoch_time_sec=duration,
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+        )
+        self._save()
+
+    def on_validation_epoch_end(self, trainer: "pl.Trainer", pl_module: "pl.LightningModule") -> None:
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        val_loss = trainer.callback_metrics.get("val/loss")
+        self._upsert(
+            trainer.current_epoch,
+            global_step=trainer.global_step,
+            val_loss=float(val_loss) if val_loss is not None else None,
+            timestamp=datetime.now().isoformat(timespec="seconds"),
+        )
+        self._save()
+
+    def _save(self) -> None:
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        json_path = os.path.join(self.log_dir, "metrics_history.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(self.history, f, indent=2)
+
+        csv_path = os.path.join(self.log_dir, "metrics_history.csv")
+        fieldnames = sorted({key for row in self.history for key in row})
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(self.history)
+
+
 def _resolve_resume_checkpoint(
     explicit_ckpt_path: Optional[str], root_ckpt_dir: str, run_name: str
 ) -> Optional[str]:
@@ -413,7 +501,8 @@ def main() -> None:
         every_n_epochs=ckpt_every,
     )
     lr_cb = LearningRateMonitor(logging_interval="step")
-    cbs = [ckpt_cb, lr_cb]
+    metrics_cb = MetricsHistoryCallback(log_dir=os.path.join(root_ckpt_dir, run_name))
+    cbs = [ckpt_cb, lr_cb, metrics_cb]
 
     # Precision setup with safe bf16/fp16 detection
     _bf16_supported = (
