@@ -218,7 +218,10 @@ def build_entries(
         if not lazy:
             entry["image"] = load_rgb_chw(path, image_size)
         else:
-            entry["source_path"] = str(path.relative_to(root))
+            # Store an absolute path so lazy loading works regardless of where the
+            # pickle ends up (e.g. Kaggle: images stay under a read-only
+            # /kaggle/input mount while the pickle is written to /kaggle/working).
+            entry["source_path"] = str(path)
         entries.append(entry)
     return entries
 
