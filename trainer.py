@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional, Union
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, LearningRateMonitor, ModelCheckpoint
