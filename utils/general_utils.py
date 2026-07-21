@@ -370,15 +370,36 @@ def load_and_prepare_data(
             if num_classes is None:
                 num_classes = len(class_to_idx)
 
+        dataset = LazyImageDataset(
+            entries,
+            image_size=image_size,
+            image_norm=image_norm,
+            class_to_idx=class_to_idx,
+            num_classes=num_classes,
+            convert_classes_to_onehot=convert_classes_to_onehot,
+        )
+
+        # Resolve the first sample eagerly so a bad path fails fast, in the main
+        # process, with an actionable message -- instead of surfacing much later
+        # as an opaque FileNotFoundError inside a DataLoader worker. This is the
+        # typical symptom of `data_args.lazy_loading` not matching how the pickle
+        # was actually built (eager vs. `--lazy` in prepare_rgb_dataset.py), or of
+        # the pickle being moved away from the original image folder.
+        if len(dataset) > 0:
+            try:
+                dataset[0]
+            except (FileNotFoundError, KeyError) as exc:
+                raise ValueError(
+                    f"Could not load the first '{split}' sample in lazy mode: {exc}. "
+                    "This usually means `data_args.lazy_loading` doesn't match how the "
+                    "pickle was built (eager vs. `--lazy`), or the pickle was moved away "
+                    "from the original image folder. Check entry['source_path'] "
+                    "(or entry['metadata']['source_path']) against the actual image "
+                    "location."
+                ) from exc
+
         return {
-            "dataset": LazyImageDataset(
-                entries,
-                image_size=image_size,
-                image_norm=image_norm,
-                class_to_idx=class_to_idx,
-                num_classes=num_classes,
-                convert_classes_to_onehot=convert_classes_to_onehot,
-            ),
+            "dataset": dataset,
             "class_map": {i: c for c, i in class_to_idx.items()} if class_to_idx is not None else None,
         }
 
