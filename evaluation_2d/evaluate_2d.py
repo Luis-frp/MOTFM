@@ -4,8 +4,12 @@ import pickle
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -16,15 +20,18 @@ def parse_args() -> argparse.Namespace:
         "--generated_path",
         type=str,
         required=True,
-        help="Path to generated dataset pickle.",
+        help=(
+            "Path to generated dataset pickle, or a directory of image files "
+            "(e.g. from `inferer.py --output_format images`)."
+        ),
     )
     parser.add_argument(
         "--reference_path",
         type=str,
         default=None,
         help=(
-            "Path to reference dataset pickle. If omitted, --generated_path is used and reference "
-            "images are read from `true_data` when available."
+            "Path to reference dataset pickle, or a directory of image files. If omitted, "
+            "--generated_path is used and reference images are read from `true_data` when available."
         ),
     )
     parser.add_argument(
@@ -139,6 +146,31 @@ def _resolve_split(data: Dict, split_name: str, label: str, path: Path) -> List[
     if len(split) == 0:
         raise ValueError(f"{label} split '{split_name}' is empty.")
     return split
+
+
+def _load_images_dir(path: Path) -> List[dict]:
+    """Loads a flat directory of image files as [0, 1] float32 entries with an 'image' key."""
+    paths = sorted(p for p in path.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_EXTENSIONS)
+    if not paths:
+        raise ValueError(f"No image files found in directory: {path}")
+
+    entries = []
+    for p in paths:
+        with Image.open(p) as img:
+            arr = np.asarray(img, dtype=np.float32) / 255.0
+        if arr.ndim == 2:
+            arr = arr[None, :, :]
+        else:
+            arr = np.transpose(arr, (2, 0, 1))
+        entries.append({"image": arr, "name": p.stem})
+    return entries
+
+
+def _load_entries(path: Path, split_name: str, label: str) -> List[dict]:
+    if path.is_dir():
+        return _load_images_dir(path)
+    data = _load_pickle(path)
+    return _resolve_split(data, split_name, label=label, path=path)
 
 
 def _ensure_channel_first_2d(tensor: torch.Tensor, *, source: str) -> torch.Tensor:
@@ -392,14 +424,8 @@ def main() -> None:
     if not reference_path.exists():
         raise FileNotFoundError(f"--reference_path does not exist: {reference_path}")
 
-    generated_data = _load_pickle(generated_path)
-    reference_data = _load_pickle(reference_path)
-    generated_entries = _resolve_split(
-        generated_data, args.generated_split, label="Generated", path=generated_path
-    )
-    reference_entries = _resolve_split(
-        reference_data, args.reference_split, label="Reference", path=reference_path
-    )
+    generated_entries = _load_entries(generated_path, args.generated_split, label="Generated")
+    reference_entries = _load_entries(reference_path, args.reference_split, label="Reference")
 
     true_images, generated_images = _pair_images(
         generated_entries,
