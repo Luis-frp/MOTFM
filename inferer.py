@@ -18,6 +18,7 @@ from utils.motfm_logging import get_logger
 from utils.utils_fm import sample_batch
 
 from trainer import FlowMatchingDataModule, FlowMatchingLightningModule
+from visualizer import save_image
 
 logger = get_logger(__name__)
 
@@ -323,12 +324,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--output_format",
+        type=str,
+        default="images",
+        choices=["images", "pkl", "both"],
+        help=(
+            "'images' saves each generated sample as a PNG directly (like visualizer.py), "
+            "'pkl' saves a single .pkl with all samples (needed for evaluate_2d.py), "
+            "'both' saves both. Default: images."
+        ),
+    )
+    parser.add_argument(
         "--output_path",
         type=str,
         default=None,
         help=(
-            "Output .pkl path. If omitted, a name derived from config/checkpoint/steps is used in "
-            "the checkpoint directory."
+            "Output path. Interpreted as a directory when saving images, or as a .pkl file path "
+            "when saving pkl (with --output_format both, it is used as the shared base name). "
+            "If omitted, a name derived from config/checkpoint/steps is used in the checkpoint "
+            "directory."
         ),
     )
     parser.add_argument(
@@ -400,30 +414,62 @@ def main():
 
     config_name = os.path.splitext(os.path.basename(config_path))[0]
     ckpt_name = metadata["checkpoint_name"]
-    output_path = args.output_path
-    if output_path is None:
-        output_path = os.path.join(
-            checkpoint_dir,
-            f"samples_{config_name}_{ckpt_name}_steps{solver_config['time_points']}.pkl",
-        )
-    output_path = os.path.abspath(os.path.expanduser(output_path))
-    output_dir = os.path.dirname(output_path) or "."
-    os.makedirs(output_dir, exist_ok=True)
+    base_name = f"samples_{config_name}_{ckpt_name}_steps{solver_config['time_points']}"
 
-    if os.path.exists(output_path):
-        if args.overwrite:
-            logger.info(f"Overwriting existing output file: {output_path}")
+    save_pkl = args.output_format in ("pkl", "both")
+    save_images = args.output_format in ("images", "both")
+
+    # Shared base path (without extension) used to derive both artifacts with --output_format both.
+    output_base = args.output_path
+    if output_base is not None and output_base.endswith(".pkl"):
+        output_base = output_base[: -len(".pkl")]
+
+    pkl_path = None
+    if save_pkl:
+        if args.output_format == "pkl" and args.output_path:
+            pkl_path = args.output_path
+        elif output_base:
+            pkl_path = f"{output_base}.pkl"
         else:
-            base, ext = os.path.splitext(output_path)
-            timestamp = time.strftime("%Y%m%d-%H%M%S")
-            ext = ext or ".pkl"
-            output_path = f"{base}_{timestamp}{ext}"
-            logger.warning(
-                "Output file already exists and --overwrite was not set. "
-                f"Writing to: {output_path}"
-            )
+            pkl_path = os.path.join(checkpoint_dir, f"{base_name}.pkl")
+        pkl_path = os.path.abspath(os.path.expanduser(pkl_path))
+        os.makedirs(os.path.dirname(pkl_path) or ".", exist_ok=True)
 
-    logger.info(f"Saving generated data to {output_path}")
+        if os.path.exists(pkl_path):
+            if args.overwrite:
+                logger.info(f"Overwriting existing output file: {pkl_path}")
+            else:
+                base, ext = os.path.splitext(pkl_path)
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                pkl_path = f"{base}_{timestamp}{ext or '.pkl'}"
+                logger.warning(
+                    "Output pkl already exists and --overwrite was not set. "
+                    f"Writing to: {pkl_path}"
+                )
+        logger.info(f"Will save generated data (pkl) to {pkl_path}")
+
+    images_dir = None
+    if save_images:
+        if args.output_format == "images" and args.output_path:
+            images_dir = args.output_path
+        elif output_base:
+            images_dir = f"{output_base}_images"
+        else:
+            images_dir = os.path.join(checkpoint_dir, f"visualization_{base_name}")
+        images_dir = os.path.abspath(os.path.expanduser(images_dir))
+
+        if os.path.isdir(images_dir) and os.listdir(images_dir):
+            if args.overwrite:
+                logger.info(f"Overwriting existing images in: {images_dir}")
+            else:
+                timestamp = time.strftime("%Y%m%d-%H%M%S")
+                images_dir = f"{images_dir}_{timestamp}"
+                logger.warning(
+                    "Output image directory already exists and is non-empty and --overwrite was "
+                    f"not set. Writing to: {images_dir}"
+                )
+        os.makedirs(images_dir, exist_ok=True)
+        logger.info(f"Will save generated images (png) to {images_dir}")
 
     # Load dataset for inference
     datamodule = FlowMatchingDataModule(config)
@@ -602,15 +648,28 @@ def main():
         for sample in generated_samples:
             sample["image"] = _normalize_sample_image(sample["image"], args.output_norm)
 
-    # Mirror generated samples under configured split keys for downstream loader compatibility.
-    generated_dataset = {split_train_key: generated_samples}
-    if split_val_key != split_train_key:
-        generated_dataset[split_val_key] = generated_samples
+    if save_pkl:
+        # Mirror generated samples under configured split keys for downstream loader compatibility.
+        generated_dataset = {split_train_key: generated_samples}
+        if split_val_key != split_train_key:
+            generated_dataset[split_val_key] = generated_samples
 
-    with open(output_path, "wb") as f:
-        pickle.dump(generated_dataset, f)
+        with open(pkl_path, "wb") as f:
+            pickle.dump(generated_dataset, f)
 
-    logger.info(f"Generated data saved to {output_path}")
+        logger.info(f"Generated data saved to {pkl_path}")
+
+    if save_images:
+        for sample in tqdm(generated_samples, desc="Saving Images"):
+            sample_name = sample.get("name", "sample")
+            class_name = sample.get("class")
+            filename = sample_name
+            if class_name:
+                filename += f"_class-{class_name}"
+            filename += ".png"
+            save_image(sample["image"], os.path.join(images_dir, filename))
+
+        logger.info(f"Saved {len(generated_samples)} images to {images_dir}")
 
 if __name__ == "__main__":
     main()
